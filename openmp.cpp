@@ -3,6 +3,8 @@
 #include <assert.h>
 #include <math.h>
 #include <vector>
+#include <iostream>
+#include <list>
 #include "common.h"
 #include "omp.h"
 
@@ -22,6 +24,16 @@ int get_bin(particle_t& p){
     return row * BIN_SIDE + col;
 }
 
+
+#define get_thread(_b) (max(min(_b / bins_per_thread, numthreads - 1),0))
+
+// #define CLAMP(_v, _l, _h) ( (_v) < (_l) ? (_l) : (((_v) > (_h)) ? (_h) : (_v)) )
+// #define get_thread_for_bin(_b) CLAMP((_b) / bins_per_thread, 0, numthreads-1)
+
+// int get_thread(int bin_id){
+//     return 
+// }
+
 bool out_range(int curI, int testI){
     int row = curI / BIN_SIDE;
     int col = curI % BIN_SIDE;
@@ -40,7 +52,7 @@ int main( int argc, char **argv )
 {   
     int navg,nabsavg=0,numthreads; 
     double dmin, absmin=1.0,davg,absavg=0.0;
-	
+    
     if( find_option( argc, argv, "-h" ) >= 0 )
     {
         printf( "Options:\n" );
@@ -71,46 +83,69 @@ int main( int argc, char **argv )
     //init bins
     BIN_SIDE = ceil(size / BIN_SIZE);
     BINS =  (BIN_SIDE * BIN_SIDE);
-    vector< vector<particle_t*> > bins;
+    vector< list<particle_t*> > bins;
     binSize = size / BIN_SIDE;
-    bins.assign(BINS, vector<particle_t*>());
+    bins.resize(BINS);
 
     int neighbor[9] = {-BIN_SIDE - 1,-BIN_SIDE,-BIN_SIDE + 1,-1,0,1,BIN_SIDE - 1,BIN_SIDE,BIN_SIDE + 1};
 
 
-    omp_lock_t* locks = (omp_lock_t*) malloc(BINS * sizeof(omp_lock_t) );
-    for (int i = 0; i < BINS; i++) {
-        omp_init_lock(locks+i);
+    // omp_lock_t* locks = (omp_lock_t*) malloc(BINS * sizeof(omp_lock_t) );
+    // for (int i = 0; i < BINS; i++) {
+    //     omp_init_lock(locks+i);
+    // }
+    vector<omp_lock_t> locks;
+    // vector<omp_lock_t> t_locks;
+    vector<list<particle_t*> > thread_block;
+
+    #pragma omp parallel
+    {
+        numthreads = omp_get_num_threads();
+    }
+
+    locks.resize(numthreads);
+    for(int i = 0; i < locks.size(); i ++){
+        omp_init_lock(&locks[i]);
+    }
+    // t_locks.resize()
+    thread_block.resize(numthreads);
+
+    int bins_per_thread = BINS / numthreads;
+
+    for(int i = 0; i < n; i ++){
+        int idx = get_bin(particles[i]);
+        int t_id = get_thread(idx);
+        thread_block[t_id].push_back(&particles[i]);
     }
 
     #pragma omp parallel private(dmin) 
     {
-    numthreads = omp_get_num_threads();
+        int thread_num = omp_get_thread_num();
+        // cout<<"thread_num = "<<thread_num<<endl;
+
+        
     for( int step = 0; step < NSTEPS; step++ )
     {
         navg = 0;
         davg = 0.0;
-	    dmin = 1.0;
-        
+        dmin = 1.0;
 
-        //assign particles
-        #pragma omp for
-        for(int i = 0; i < n; i ++){
-            int idx = get_bin(particles[i]);
-            omp_set_lock(locks+idx);
-            bins[idx].push_back(&particles[i]);
-            omp_unset_lock(locks+idx);
+        printf("%d\n", thread_num);
+
+        for(list<particle_t*> ::iterator it = thread_block[thread_num].begin(); it != thread_block[thread_num].end(); it ++){
+            int idx = get_bin(**it);
+            // omp_set_lock(&locks[idx]);
+            list<particle_t*>::iterator it_l = it;
+            it --;
+            bins[idx].splice(bins[idx].begin(), thread_block[thread_num], it_l);
+            // omp_unset_lock(&locks[idx]);
         }
-
+        // thread_block[thread_num].clear();
         #pragma omp barrier
-        // #pragma omp barrier
-        //
-        //  compute all forces by bins
-        //
 
-        #pragma omp for reduction (+:navg) reduction(+:davg)
+        #pragma omp for schedule(static, bins_per_thread) reduction (+:navg) reduction(+:davg)
         for(int i = 0; i < BINS; i ++){
-            for(vector<particle_t*>::iterator it = bins[i].begin(); it != bins[i].end(); it++){
+            for(list<particle_t*>::iterator it = bins[i].begin(); it != bins[i].end(); it++){
                 (*it) -> ax = 0;
                 (*it) -> ay = 0;
                 for(int j = 0;j < 9; j ++){
@@ -119,26 +154,49 @@ int main( int argc, char **argv )
                         continue;
                     }
                     if(newJ >= 0 && newJ < BINS){
-                        for(vector<particle_t*>::iterator it_nb = bins[newJ].begin(); it_nb != bins[newJ].end(); it_nb++){
+                        for(list<particle_t*>::iterator it_nb = bins[newJ].begin(); it_nb != bins[newJ].end(); it_nb++){
                             apply_force( **it, **it_nb,&dmin,&davg,&navg);
                         }
                     }
                 }
             }
         }
-        
-		//
+
+        // #pragma omp barrier
+
+        //
         //move particles and clear buffermove particles
         //
         #pragma omp for
         for(int i = 0; i < BINS; i ++){
-            for(vector<particle_t*>::iterator it = bins[i].begin(); it != bins[i].end(); it++){
-                move(**it);   
+            for(list<particle_t*>::iterator it = bins[i].begin(); it != bins[i].end(); it++){
+                move(**it); 
+                int idx = get_bin(**it);
+                if(idx == i){
+                    continue;
+                }else{
+                    int t_id = get_thread(idx);
+                    list<particle_t*>::iterator it_l = it;
+                    it --;
+                    omp_set_lock(&locks[t_id]);
+                    thread_block[t_id].splice(thread_block[t_id].begin(), bins[i], it_l);
+                    omp_unset_lock(&locks[t_id]);
+                }
             } 
-            bins[i].clear(); 
+            // bins[i].clear(); 
         }
-  
         #pragma omp barrier
+
+
+        // for(list<particle_t*> ::iterator it = thread_block[thread_num].begin(); it != thread_block[thread_num].end(); it ++){
+        //     int idx = get_bin(**it);
+        //     // omp_set_lock(&locks[idx]);
+        //     bins[idx].push_back(*it);
+        //     // omp_unset_lock(&locks[idx]);
+        // }
+        // thread_block[thread_num].clear();
+        // #pragma omp barrier
+        
         if( find_option( argc, argv, "-no" ) == -1 ) 
         {
           //
@@ -151,8 +209,8 @@ int main( int argc, char **argv )
           }
 
           #pragma omp critical
-	      if (dmin < absmin) absmin = dmin; 
-		
+          if (dmin < absmin) absmin = dmin; 
+        
           //
           //  save if necessary
           //
@@ -160,8 +218,13 @@ int main( int argc, char **argv )
           if( fsave && (step%SAVEFREQ) == 0 )
               save( fsave, n, particles );
         }
+        #pragma omp barrier
     }
 }
+    for(int i = 0; i < locks.size(); i ++){
+        omp_destroy_lock(&locks[i]);
+    }
+    
     simulation_time = read_timer( ) - simulation_time;
     
     printf( "n = %d,threads = %d, simulation time = %g seconds", n,numthreads, simulation_time);
